@@ -227,10 +227,7 @@ impl State {
 
         let buffer = match self.child_buffers.get_free_buffer() {
             Some(buffer) => buffer,
-            None => {
-                println!("[!] No buffers available, waiting for buffers to be available.");
-                return;
-            }
+            None => return,
         };
 
         let frame = &self.animation.frame();
@@ -270,28 +267,38 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
-            name, interface, ..
+            name,
+            interface,
+            version,
         } = event
         {
             match &interface[..] {
                 "wl_compositor" => {
-                    state.compositor =
-                        Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ()));
+                    state.compositor = Some(registry.bind::<wl_compositor::WlCompositor, _, _>(
+                        name,
+                        version,
+                        qh,
+                        (),
+                    ));
                 }
                 "wl_subcompositor" => {
-                    state.subcompositor = Some(
-                        registry.bind::<wl_subcompositor::WlSubcompositor, _, _>(name, 1, qh, ()),
-                    );
+                    state.subcompositor =
+                        Some(registry.bind::<wl_subcompositor::WlSubcompositor, _, _>(
+                            name,
+                            version,
+                            qh,
+                            (),
+                        ));
                 }
                 "wl_shm" => {
-                    state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, ()));
+                    state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(name, version, qh, ()));
                 }
                 "wl_seat" => {
-                    registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
+                    registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
                 }
                 "xdg_wm_base" => {
                     state.wm_base =
-                        Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
+                        Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, version, qh, ()));
                 }
                 _ => {}
             }

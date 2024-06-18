@@ -1,10 +1,10 @@
-use std::{error::Error, fs::File, os::unix::io::AsFd, process::ExitCode};
+use std::{error::Error, fs::File, ops::Range, os::unix::io::AsFd, process::ExitCode};
 
 use wayland_client::{
     delegate_noop,
     protocol::{
-        wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-        wl_subcompositor, wl_subsurface, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     },
     Connection, Dispatch, QueueHandle, WEnum,
 };
@@ -17,7 +17,6 @@ use rand::Rng;
 
 fn main() -> Result<ExitCode, Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
-
     let mut event_queue = conn.new_event_queue();
     let qhandle = event_queue.handle();
 
@@ -25,24 +24,57 @@ fn main() -> Result<ExitCode, Box<dyn Error>> {
     display.get_registry(&qhandle, ());
 
     let mut state = State::new()?;
-    event_queue.blocking_dispatch(&mut state)?;
+    event_queue.roundtrip(&mut state)?;
 
     state.registry_post_process(&qhandle);
+    event_queue.roundtrip(&mut state)?;
+
+    state.draw();
 
     while state.running {
-        event_queue.roundtrip(&mut state)?;
+        event_queue.blocking_dispatch(&mut state)?;
 
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        state.draw();
+        if state.repaint_required {
+            state.draw();
+        }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+struct Buffer {
+    buffer: wl_buffer::WlBuffer,
+    mmap_range: Range<usize>,
+    in_use: bool,
+}
+
+struct BufferList(Vec<Buffer>);
+
+impl BufferList {
+    fn new() -> BufferList {
+        BufferList(Vec::new())
+    }
+
+    fn push(&mut self, buffer: Buffer) {
+        self.0.push(buffer);
+    }
+
+    fn get_free_buffer(&mut self) -> Option<&mut Buffer> {
+        self.0.iter_mut().find(|b| !b.in_use)
+    }
+
+    fn set_in_use(&mut self, wlbuf: &wl_buffer::WlBuffer, in_use: bool) {
+        if let Some(ref mut buffer) = self.0.iter_mut().find(|b| &b.buffer == wlbuf) {
+            buffer.in_use = in_use;
+        }
+    }
 }
 
 struct State {
     running: bool,
     configured: bool,
     fullscreen_requested: bool,
+    repaint_required: bool,
 
     compositor: Option<wl_compositor::WlCompositor>,
     subcompositor: Option<wl_subcompositor::WlSubcompositor>,
@@ -55,7 +87,7 @@ struct State {
 
     child_surface: Option<wl_surface::WlSurface>,
     child_subsurface: Option<wl_subsurface::WlSubsurface>,
-    child_buffer: Option<wl_buffer::WlBuffer>,
+    child_buffers: BufferList,
 
     file: File,
     mmap: MmapMut,
@@ -69,9 +101,14 @@ impl State {
         let mut rng = rand::thread_rng();
         let side = rand::distributions::Uniform::new(2, 30);
 
-        let animation = Animation::new(rng.sample(side), 15, 6);
+        let animation = Animation {
+            walk_step: rng.sample(side),
+            jump_step: 15,
+            jump_count: 6,
+            ..Animation::new()
+        };
 
-        let buffer_pool_size = (animation.frame().len() + 4) as _;
+        let buffer_pool_size = (animation.frame().len() * 2 + 4) as _;
         let file = tempfile::tempfile()?;
         file.set_len(buffer_pool_size)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -80,6 +117,7 @@ impl State {
             running: true,
             configured: false,
             fullscreen_requested: false,
+            repaint_required: false,
 
             compositor: None,
             subcompositor: None,
@@ -92,7 +130,7 @@ impl State {
 
             child_surface: None,
             child_subsurface: None,
-            child_buffer: None,
+            child_buffers: BufferList::new(),
 
             file,
             mmap,
@@ -119,25 +157,21 @@ impl State {
         let child_subsurface =
             subcompositor.get_subsurface(&child_surface, &parent_surface, qh, ());
         child_subsurface.set_sync();
+        child_surface.frame(
+            qh,
+            FrameDone {
+                base_time: None,
+                count: 0,
+            },
+        );
 
         let frame = &self.animation.frame();
         let shm = self.shm.as_ref().unwrap();
-        let pool = shm.create_pool(self.file.as_fd(), self.buffer_pool_size as i32, qh, ());
-
-        let (init_w, init_h) = frame.dimensions();
-        self.child_buffer = Some(pool.create_buffer(
-            0,
-            init_w as i32,
-            init_h as i32,
-            (init_w * 4) as i32,
-            wl_shm::Format::Argb8888,
-            qh,
-            (),
-        ));
+        let pool = shm.create_pool(self.file.as_fd(), self.buffer_pool_size as _, qh, ());
 
         let (init_w, init_h) = (1, 1);
         self.parent_buffer = Some(pool.create_buffer(
-            frame.len() as _,
+            0,
             init_w,
             init_h,
             init_w * 4,
@@ -145,7 +179,40 @@ impl State {
             qh,
             (),
         ));
+        self.mmap[0..4].fill(0);
         parent_surface.attach(self.parent_buffer.as_ref(), 0, 0);
+
+        let (init_w, init_h) = frame.dimensions();
+
+        let offset: usize = 4;
+        self.child_buffers.push(Buffer {
+            buffer: pool.create_buffer(
+                offset as _,
+                init_w as i32,
+                init_h as i32,
+                (init_w * 4) as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            ),
+            mmap_range: offset..offset + frame.len(),
+            in_use: false,
+        });
+
+        let offset: usize = 4 + frame.len();
+        self.child_buffers.push(Buffer {
+            buffer: pool.create_buffer(
+                offset as _,
+                init_w as i32,
+                init_h as i32,
+                (init_w * 4) as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            ),
+            mmap_range: offset..offset + frame.len(),
+            in_use: false,
+        });
 
         self.parent_surface = Some(parent_surface);
         self.parent_xdg_surface = Some((parent_xdg_surface, toplevel));
@@ -158,28 +225,38 @@ impl State {
             return;
         }
 
-        let frame = &self.animation.frame();
+        let buffer = match self.child_buffers.get_free_buffer() {
+            Some(buffer) => buffer,
+            None => {
+                println!("[!] No buffers available, waiting for buffers to be available.");
+                return;
+            }
+        };
 
-        let mut i = 0;
-        for pixel in frame.pixels() {
+        let frame = &self.animation.frame();
+        let mmap = &mut self.mmap[buffer.mmap_range.clone()];
+
+        for (i, pixel) in frame.pixels().enumerate() {
             let p = pixel.channels();
-            self.mmap[i..i + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
-            i += 4;
+            mmap[i * 4..i * 4 + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
         }
 
-        let child_subsurface = self.child_subsurface.as_ref().unwrap();
         let position = self.animation.position();
-        child_subsurface.set_position(position.0, position.1);
+        self.child_subsurface
+            .as_ref()
+            .unwrap()
+            .set_position(position.0, position.1);
 
         let child_surface = self.child_surface.as_ref().unwrap();
-        child_surface.attach(self.child_buffer.as_ref(), 0, 0);
+        buffer.in_use = true;
+        child_surface.attach(Some(&buffer.buffer), 0, 0);
         child_surface.damage(0, 0, frame.width() as i32, frame.height() as i32);
         child_surface.commit();
 
-        let parent_surface = self.parent_surface.as_ref().unwrap();
-        parent_surface.commit();
+        self.parent_surface.as_ref().unwrap().commit();
 
         self.animation.next();
+        self.repaint_required = false;
     }
 }
 
@@ -222,14 +299,85 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     }
 }
 
-// Ignore events from these object types in this example.
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
 delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
 delegate_noop!(State: ignore wl_surface::WlSurface);
 delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(State: ignore wl_buffer::WlBuffer);
+
+struct FrameDone {
+    base_time: Option<u32>,
+    count: u32,
+}
+
+impl Dispatch<wl_callback::WlCallback, FrameDone> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        info: &FrameDone,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done {
+            callback_data: time,
+        } = event
+        {
+            let frame_info = match info {
+                FrameDone {
+                    base_time: Some(base),
+                    count,
+                } if time - base >= 5000 => {
+                    let frames = count + 1;
+                    let duration_ms = (time - base) as f64;
+                    println!(
+                        "{} frames in {:.3} seconds = {:.3} FPS",
+                        frames,
+                        duration_ms / 1000.0,
+                        (frames * 1000) as f64 / duration_ms
+                    );
+
+                    FrameDone {
+                        base_time: Some(time),
+                        count: 0,
+                    }
+                }
+                FrameDone {
+                    base_time: Some(base),
+                    count,
+                } => FrameDone {
+                    base_time: Some(*base),
+                    count: count + 1,
+                },
+                FrameDone {
+                    base_time: None, ..
+                } => FrameDone {
+                    base_time: Some(time),
+                    count: 0,
+                },
+            };
+
+            state.child_surface.as_ref().unwrap().frame(qh, frame_info);
+            state.repaint_required = true;
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for State {
+    fn event(
+        state: &mut Self,
+        buffer: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release {} = event {
+            state.child_buffers.set_in_use(buffer, false);
+        }
+    }
+}
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
     fn event(
@@ -277,15 +425,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
                 height,
                 states,
             } => {
-                //dbg!(width, height, &states);
-
                 if states.contains(&(xdg_toplevel::State::Fullscreen as _))
                     && state.fullscreen_requested
                 {
-                    state.fullscreen_requested = false;
                     state.animation.area = (width as _, height as _);
 
-                    state.draw();
+                    state.fullscreen_requested = false;
+                    state.repaint_required = true;
                 }
             }
             xdg_toplevel::Event::Close => state.running = false,
@@ -375,7 +521,7 @@ struct Animation {
 }
 
 impl Animation {
-    fn new(walk_step: u64, jump_step: u64, jump_count: u64) -> Self {
+    fn new() -> Self {
         const IMAGE_PATHS: [&str; 3] = ["image/out01.png", "image/out02.png", "image/out03.png"];
 
         let frames: Vec<_> = IMAGE_PATHS
@@ -398,9 +544,9 @@ impl Animation {
             jump: JumpState::NotJumping,
             forward: true,
 
-            walk_step,
-            jump_count,
-            jump_step,
+            walk_step: 15,
+            jump_count: 15,
+            jump_step: 6,
 
             frames,
             frames_flipped,
@@ -424,8 +570,6 @@ impl Animation {
     }
 
     fn next(&mut self) {
-        //dbg!(self.x, self.y, self.position(), self.area);
-
         self.count += 1;
         self.jump.next(self.jump_step, self.jump_count);
 
